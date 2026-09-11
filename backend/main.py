@@ -7,6 +7,7 @@
 #   3. 降采样: 固定桶大小时间窗口聚合 (LTTB 风格桶聚合)
 #   4. 自动路由: 大时间跨度查询命中小时级预聚合表
 #   5. 异常点检测: 基于滑动窗口 Z-Score
+#   6. 阈值告警: 每指标可配置正常范围与告警上下限, 查询结果携带异常标记
 # =============================================================
 import math
 import os
@@ -16,7 +17,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import pymysql
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -84,6 +85,39 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------
+# 阈值配置表 DDL: 启动时自动创建, 已有部署无需重建数据卷即可平滑升级
+# ---------------------------------------------------------------
+THRESHOLD_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS metric_thresholds (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    metric_name VARCHAR(64) NOT NULL COMMENT '指标名',
+    instance    VARCHAR(64) NOT NULL DEFAULT '' COMMENT '实例标识, 空串为全局默认',
+    normal_min  DOUBLE NULL COMMENT '正常范围下限',
+    normal_max  DOUBLE NULL COMMENT '正常范围上限',
+    warn_low    DOUBLE NULL COMMENT '告警下限, 低于即异常',
+    warn_high   DOUBLE NULL COMMENT '告警上限, 超过即异常',
+    enabled     TINYINT(1)  NOT NULL DEFAULT 1 COMMENT '是否启用',
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_metric_instance (metric_name, instance)
+) ENGINE=InnoDB COMMENT='指标告警阈值配置'
+"""
+
+
+@app.on_event("startup")
+def _init_threshold_table():
+    """等待数据库就绪后创建阈值表 (容器编排下 MySQL 初始化可能略慢)。"""
+    for _ in range(30):
+        try:
+            with pool.acquire() as conn, conn.cursor() as cur:
+                cur.execute(THRESHOLD_TABLE_DDL)
+            return
+        except Exception:
+            time.sleep(2)
+
+
+# ---------------------------------------------------------------
 # 健康检查 (供容器编排 healthcheck 使用)
 # ---------------------------------------------------------------
 @app.get("/api/health")
@@ -105,6 +139,16 @@ class DataPoint(BaseModel):
 
 class BatchWriteRequest(BaseModel):
     points: list[DataPoint]
+
+
+class ThresholdConfig(BaseModel):
+    metric: str = Field(..., description="指标名")
+    instance: str = Field("", description="实例标识, 空串为全局默认配置")
+    normal_min: Optional[float] = Field(None, description="正常范围下限")
+    normal_max: Optional[float] = Field(None, description="正常范围上限")
+    warn_low: Optional[float] = Field(None, description="告警下限, 低于即异常")
+    warn_high: Optional[float] = Field(None, description="告警上限, 超过即异常")
+    enabled: bool = True
 
 
 # ---------------------------------------------------------------
@@ -135,6 +179,43 @@ def _resolve_metric_ids(cursor, names: list[str], instance: str = "") -> dict[st
     for row in cursor.fetchall():
         result.setdefault(row["name"], []).append(row["id"])
     return result
+
+
+# ---------------------------------------------------------------
+# 阈值工具函数
+# ---------------------------------------------------------------
+def _load_thresholds(cursor, names: list[str], instance: str = "") -> dict[str, dict]:
+    """批量加载指标阈值配置。
+    优先取精确匹配 (name, instance) 的配置, 缺省回退到全局默认 (name, '')。"""
+    if not names:
+        return {}
+    fmt = ",".join(["%s"] * len(names))
+    cursor.execute(
+        f"SELECT metric_name, instance, normal_min, normal_max, warn_low, warn_high "
+        f"FROM metric_thresholds WHERE enabled=1 AND metric_name IN ({fmt})",
+        names,
+    )
+    result: dict[str, dict] = {}
+    for row in cursor.fetchall():
+        name = row.pop("metric_name")
+        inst = row.pop("instance")
+        if inst == instance:
+            # 精确实例配置始终优先
+            result[name] = row
+        elif inst == "" and name not in result:
+            result[name] = row
+    return result
+
+
+def _is_abnormal(value: float, th: dict) -> bool:
+    """根据阈值判定单个值是否异常: 告警上下限优先, 未设置时回退到正常范围边界。"""
+    hi = th["warn_high"] if th["warn_high"] is not None else th["normal_max"]
+    lo = th["warn_low"] if th["warn_low"] is not None else th["normal_min"]
+    if hi is not None and value > hi:
+        return True
+    if lo is not None and value < lo:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------
@@ -189,6 +270,56 @@ def list_metrics():
 
 
 # ---------------------------------------------------------------
+# API: 阈值配置 (查询/新增/更新/删除)
+# ---------------------------------------------------------------
+@app.get("/api/thresholds")
+def list_thresholds():
+    """返回全部阈值配置, 前端配置面板与图表标注共用。"""
+    with pool.acquire() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, metric_name AS metric, instance, normal_min, normal_max, "
+            "       warn_low, warn_high, enabled, updated_at "
+            "FROM metric_thresholds ORDER BY metric_name, instance"
+        )
+        rows = cur.fetchall()
+        for r in rows:
+            r["updated_at"] = r["updated_at"].isoformat() if r["updated_at"] else None
+        return rows
+
+
+@app.put("/api/thresholds")
+def upsert_threshold(cfg: ThresholdConfig):
+    """新增或更新某指标(可指定实例)的阈值配置, 按 (metric, instance) 幂等 upsert。"""
+    if cfg.normal_min is not None and cfg.normal_max is not None and cfg.normal_min > cfg.normal_max:
+        raise HTTPException(400, "正常范围下限不能大于上限")
+    if cfg.warn_low is not None and cfg.warn_high is not None and cfg.warn_low > cfg.warn_high:
+        raise HTTPException(400, "告警下限不能大于告警上限")
+    with pool.acquire() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO metric_thresholds "
+            "  (metric_name, instance, normal_min, normal_max, warn_low, warn_high, enabled) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE "
+            "  normal_min=VALUES(normal_min), normal_max=VALUES(normal_max), "
+            "  warn_low=VALUES(warn_low), warn_high=VALUES(warn_high), enabled=VALUES(enabled)",
+            (cfg.metric, cfg.instance, cfg.normal_min, cfg.normal_max,
+             cfg.warn_low, cfg.warn_high, int(cfg.enabled)),
+        )
+    return {"status": "ok"}
+
+
+@app.delete("/api/thresholds")
+def delete_threshold(metric: str = Query(...), instance: str = Query("")):
+    """删除某指标(指定实例)的阈值配置。"""
+    with pool.acquire() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM metric_thresholds WHERE metric_name=%s AND instance=%s",
+            (metric, instance),
+        )
+    return {"deleted": cur.rowcount}
+
+
+# ---------------------------------------------------------------
 # API: 聚合查询 (min/max/avg/sum) + 降采样
 # ---------------------------------------------------------------
 # 降采样桶大小映射: 根据查询时间跨度自动选择, 保证返回点数适中
@@ -238,6 +369,7 @@ def query_metrics(
     t0 = time.perf_counter()
     with pool.acquire() as conn, conn.cursor() as cur:
         id_map = _resolve_metric_ids(cur, names, instance)
+        thresholds = _load_thresholds(cur, names, instance)
         for name, mids in id_map.items():
             if not mids:
                 continue
@@ -259,16 +391,24 @@ def query_metrics(
                     "GROUP BY FLOOR(UNIX_TIMESTAMP(ts)/%s) ORDER BY bucket"
                 )
             cur.execute(sql, (*mids, start_dt, end_dt, bucket_sec))
-            result[name] = [
-                {"ts": int(row["bucket"].timestamp()), "value": round(float(row["v"]), 4) if row["v"] is not None else None}
-                for row in cur.fetchall()
-            ]
+            th = thresholds.get(name)
+            points = []
+            for row in cur.fetchall():
+                v = round(float(row["v"]), 4) if row["v"] is not None else None
+                points.append({
+                    "ts": int(row["bucket"].timestamp()),
+                    "value": v,
+                    # 阈值异常标记: 1=超出告警上下限, 供前端红色高亮异常区间
+                    "abnormal": 1 if (th and v is not None and _is_abnormal(v, th)) else 0,
+                })
+            result[name] = points
     elapsed = (time.perf_counter() - t0) * 1000
     return {
         "bucket_seconds": bucket_sec,
         "source": "hourly" if use_hourly else "raw",
         "elapsed_ms": round(elapsed, 2),
         "series": result,
+        "thresholds": thresholds,
     }
 
 
@@ -287,6 +427,7 @@ def latest_points(
     result: dict[str, list] = {}
     with pool.acquire() as conn, conn.cursor() as cur:
         id_map = _resolve_metric_ids(cur, names, instance)
+        thresholds = _load_thresholds(cur, names, instance)
         for name, mids in id_map.items():
             if not mids:
                 continue
@@ -296,8 +437,13 @@ def latest_points(
                 f"WHERE {id_cond} AND ts >= %s ORDER BY ts",
                 (*mids, since),
             )
-            result[name] = [{"ts": int(r["ts"]), "value": r["value"]} for r in cur.fetchall()]
-    return {"series": result}
+            th = thresholds.get(name)
+            result[name] = [
+                {"ts": int(r["ts"]), "value": r["value"],
+                 "abnormal": 1 if (th and _is_abnormal(r["value"], th)) else 0}
+                for r in cur.fetchall()
+            ]
+    return {"series": result, "thresholds": thresholds}
 
 
 # ---------------------------------------------------------------

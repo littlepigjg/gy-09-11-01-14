@@ -103,9 +103,12 @@ tsdb/
 | --- | --- | --- |
 | POST | `/api/write` | 批量写入数据点 |
 | GET | `/api/metrics` | 指标列表与数据点统计 |
-| GET | `/api/query` | 聚合 + 降采样查询（`metrics/start/end/agg/bucket`） |
-| GET | `/api/latest` | 最近窗口原始点（实时曲线） |
+| GET | `/api/query` | 聚合 + 降采样查询（`metrics/start/end/agg/bucket`），返回每点 `abnormal` 越限标记与阈值配置 |
+| GET | `/api/latest` | 最近窗口原始点（实时曲线），返回每点 `abnormal` 越限标记与阈值配置 |
 | GET | `/api/anomalies` | 滑动窗口 Z-Score 异常点检测 |
+| GET | `/api/thresholds` | 阈值配置列表 |
+| PUT | `/api/thresholds` | 新增/更新指标阈值（正常范围 + 告警上下限，按 `metric+instance` upsert） |
+| DELETE | `/api/thresholds` | 删除指标阈值（`metric/instance` 参数） |
 | GET | `/api/health` | 健康检查 |
 
 写入示例：
@@ -134,6 +137,8 @@ curl "http://localhost:8000/api/query?metrics=cpu.usage,mem.usage&start=17888000
 2. 预聚合表 `metric_data_hourly`：事件每小时增量聚合；大跨度查询自动改查预聚合表，avg 以 `SUM(sum)/SUM(count)` 加权保证准确性。
 
 **异常检测**：对每个数据点用其前 N 个点（默认 20）计算均值与标准差，`|z| > 阈值（默认 3）`判定为异常并返回坐标，前端以红色散点叠加在曲线上。
+
+**阈值告警**：`metric_thresholds` 表按 `指标+实例` 持久化正常范围与告警上下限（实例为空串表示全局默认，精确实例配置优先）。`/api/query` 与 `/api/latest` 返回每个点的 `abnormal` 标记（告警上下限优先，未设置时回退到正常范围边界），前端将连续越限点合并为红色背景区间（markArea）并叠加告警上下限虚线，运维人员可一眼定位异常时段。
 
 ## 本地开发（可选）
 

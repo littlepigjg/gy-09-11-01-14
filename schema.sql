@@ -42,6 +42,27 @@ PARTITION BY RANGE (TO_DAYS(ts)) (
 );
 
 -- ---------------------------------------------------------------
+-- 指标告警阈值配置表
+--   正常范围 [normal_min, normal_max] 供展示参考;
+--   告警上下限 warn_low/warn_high 用于判定异常(未设置时回退到正常范围边界)
+--   instance 为空串表示该指标的全局默认配置
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS metric_thresholds (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    metric_name VARCHAR(64) NOT NULL COMMENT '指标名',
+    instance    VARCHAR(64) NOT NULL DEFAULT '' COMMENT '实例标识, 空串为全局默认',
+    normal_min  DOUBLE NULL COMMENT '正常范围下限',
+    normal_max  DOUBLE NULL COMMENT '正常范围上限',
+    warn_low    DOUBLE NULL COMMENT '告警下限, 低于即异常',
+    warn_high   DOUBLE NULL COMMENT '告警上限, 超过即异常',
+    enabled     TINYINT(1)  NOT NULL DEFAULT 1 COMMENT '是否启用',
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_metric_instance (metric_name, instance)
+) ENGINE=InnoDB COMMENT='指标告警阈值配置';
+
+-- ---------------------------------------------------------------
 -- 小时级预聚合表(降采样结果): 查询大时间跨度时避免扫描原始数据
 -- ---------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS metric_data_hourly (

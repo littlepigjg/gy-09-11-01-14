@@ -90,3 +90,39 @@ button.primary { background: linear-gradient(90deg, #1565c0, #4527a0); border: n
 .meta .hl { color: #4fc3f7; }
 
 .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+
+.legend-patch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  background: rgba(255, 82, 82, 0.35);
+  border: 1px solid rgba(255, 82, 82, 0.6);
+  border-radius: 2px;
+  margin-right: 4px;
+}
+
+.legend-line {
+  display: inline-block;
+  width: 16px;
+  border-top: 2px dashed #ff5252;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
+/* ---------- 阈值配置面板 ---------- */
+.th-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.th-table th, .th-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #1d273b; }
+.th-table th { color: #7a869e; font-weight: 500; font-size: 12px; white-space: nowrap; }
+.th-table .th-name { color: #4fc3f7; font-family: ui-monospace, monospace; }
+.th-table input {
+  width: 100px;
+  background: #1e2940;
+  color: #d7dde8;
+  border: 1px solid #31405e;
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+.th-table input:focus { outline: none; border-color: #4fc3f7; }
+.th-ops { white-space: nowrap; }
+.th-ops button { margin-right: 8px; }
